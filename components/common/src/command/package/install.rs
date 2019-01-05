@@ -37,7 +37,8 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::str::FromStr;
@@ -48,17 +49,18 @@ use glob;
 use hcore;
 use hcore::crypto::keys::parse_name_with_rev;
 use hcore::crypto::{artifact, SigKeyPair};
-use hcore::fs::cache_key_path;
-use hcore::fs::pkg_install_path;
+use hcore::fs::{cache_key_path, pkg_install_path, svc_hooks_path};
 use hcore::package::list::temp_package_directory;
 use hcore::package::metadata::PackageType;
 use hcore::package::{Identifiable, PackageArchive, PackageIdent, PackageInstall, PackageTarget};
 use hyper::status::StatusCode;
+use retry::retry;
 
 use error::{Error, Result};
+use templating;
+use templating::hooks::{Hook, InstallHook, INSTALL_HOOK_STATUS_FILE};
+use templating::package::Pkg;
 use ui::{Status, UIWriter};
-
-use retry::retry;
 
 pub const RETRIES: u64 = 5;
 pub const RETRY_WAIT: u64 = 3000;
@@ -194,6 +196,22 @@ pub enum InstallMode {
 impl Default for InstallMode {
     fn default() -> Self {
         InstallMode::Online
+    }
+}
+
+/// Governs how install hooks behave when loading packages
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallHookMode {
+    /// Run the install hook and all install hooks of dependent packages
+    /// that have not yet been run or have previously failed
+    Run,
+    /// Do not run any install hooks when loading a package
+    Ignore,
+}
+
+impl Default for InstallHookMode {
+    fn default() -> Self {
+        InstallHookMode::Run
     }
 }
 
@@ -337,6 +355,7 @@ pub fn start<U, P1, P2>(
     token: Option<&str>,
     install_mode: &InstallMode,
     local_package_usage: &LocalPackageUsage,
+    install_hook_mode: &InstallHookMode,
 ) -> Result<PackageInstall>
 where
     U: UIWriter,
@@ -363,6 +382,7 @@ where
         fs_root_path.as_ref(),
         artifact_cache_path.as_ref(),
         &key_cache_path,
+        install_hook_mode,
     )?;
 
     match *install_source {
@@ -371,6 +391,76 @@ where
         }
         InstallSource::Archive(ref local_archive) => task.from_archive(ui, local_archive, token),
     }
+}
+
+pub fn check_install_hooks<T, P>(
+    ui: &mut T,
+    package: &PackageInstall,
+    fs_root_path: P,
+) -> Result<()>
+where
+    T: UIWriter,
+    P: AsRef<Path>,
+{
+    for dependency in package.tdeps()?.iter() {
+        run_install_hook_unless_already_successful(
+            ui,
+            &PackageInstall::load(dependency, Some(fs_root_path.as_ref()))?,
+        )?;
+    }
+
+    run_install_hook_unless_already_successful(ui, &package)
+}
+
+fn run_install_hook_unless_already_successful<T>(ui: &mut T, package: &PackageInstall) -> Result<()>
+where
+    T: UIWriter,
+{
+    match read_install_hook_status(package.installed_path.join(INSTALL_HOOK_STATUS_FILE))? {
+        Some(0) => Ok(()),
+        _ => run_install_hook(ui, package),
+    }
+}
+
+fn read_install_hook_status(path: PathBuf) -> Result<Option<i32>> {
+    match File::open(&path) {
+        Ok(file) => {
+            let reader = BufReader::new(file);
+            match reader.lines().next() {
+                Some(Ok(line)) => match line.parse::<i32>() {
+                    Ok(status) => Ok(Some(status)),
+                    Err(_) => Err(Error::StatusFileCorrupt(path)),
+                },
+                _ => Err(Error::StatusFileCorrupt(path)),
+            }
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn run_install_hook<T>(ui: &mut T, package: &PackageInstall) -> Result<()>
+where
+    T: UIWriter,
+{
+    if let Some(ref hook) = InstallHook::load(
+        &package.ident.name,
+        &svc_hooks_path(package.ident.name.clone()),
+        &package.installed_path.join("hooks"),
+    ) {
+        ui.status(
+            Status::Executing,
+            format!("install hook for '{}'", &package.ident(),),
+        )?;
+        templating::compile_for_package_install(package)?;
+        if !hook.run(
+            &package.ident().name,
+            &Pkg::from_install(package)?,
+            None::<String>,
+        ) {
+            return Err(Error::InstallHookFailed(package.ident().clone()));
+        }
+    }
+    Ok(())
 }
 
 struct InstallTask<'a> {
@@ -382,6 +472,7 @@ struct InstallTask<'a> {
     /// The path to the local artifact cache (e.g., /hab/cache/artifacts)
     artifact_cache_path: &'a Path,
     key_cache_path: &'a Path,
+    install_hook_mode: &'a InstallHookMode,
 }
 
 impl<'a> InstallTask<'a> {
@@ -395,6 +486,7 @@ impl<'a> InstallTask<'a> {
         fs_root_path: &'a Path,
         artifact_cache_path: &'a Path,
         key_cache_path: &'a Path,
+        install_hook_mode: &'a InstallHookMode,
     ) -> Result<Self> {
         Ok(InstallTask {
             install_mode: install_mode,
@@ -404,6 +496,7 @@ impl<'a> InstallTask<'a> {
             fs_root_path: fs_root_path,
             artifact_cache_path: artifact_cache_path,
             key_cache_path: key_cache_path,
+            install_hook_mode: install_hook_mode,
         })
     }
 
@@ -437,6 +530,9 @@ impl<'a> InstallTask<'a> {
             Some(package_install) => {
                 // The installed package was found on disk
                 ui.status(Status::Using, &target_ident)?;
+                if self.install_hook_mode != &InstallHookMode::Ignore {
+                    check_install_hooks(ui, &package_install, self.fs_root_path)?;
+                }
                 ui.end(format!(
                     "Install of {} complete with {} new packages installed.",
                     &target_ident, 0
@@ -467,6 +563,9 @@ impl<'a> InstallTask<'a> {
             Some(package_install) => {
                 // The installed package was found on disk
                 ui.status(Status::Using, &target_ident)?;
+                if self.install_hook_mode != &InstallHookMode::Ignore {
+                    check_install_hooks(ui, &package_install, self.fs_root_path)?;
+                }
                 ui.end(format!(
                     "Install of {} complete with {} new packages installed.",
                     &target_ident, 0
@@ -631,6 +730,12 @@ impl<'a> InstallTask<'a> {
                         .is_some()
                     {
                         ui.status(Status::Using, dependency)?;
+                        if self.install_hook_mode != &InstallHookMode::Ignore {
+                            run_install_hook_unless_already_successful(
+                                ui,
+                                &PackageInstall::load(dependency, Some(self.fs_root_path))?,
+                            )?;
+                        }
                     } else {
                         artifacts_to_install.push(self.get_cached_artifact(
                             ui,
@@ -648,6 +753,12 @@ impl<'a> InstallTask<'a> {
                 // Ensure all uninstalled artifacts get installed
                 for artifact in artifacts_to_install.iter_mut() {
                     self.unpack_artifact(ui, artifact)?;
+                    if self.install_hook_mode != &InstallHookMode::Ignore {
+                        run_install_hook(
+                            ui,
+                            &PackageInstall::load(&artifact.ident()?, Some(self.fs_root_path))?,
+                        )?;
+                    }
                 }
 
                 ui.end(format!(

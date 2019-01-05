@@ -745,10 +745,10 @@ _install_dependency() {
               "${HAB_FEAT_IGNORE_LOCAL:-}" = "TRUE" ]]; then
         IGNORE_LOCAL="--ignore-local"
     fi
-    $HAB_BIN install -u $HAB_BLDR_URL --channel $HAB_BLDR_CHANNEL ${IGNORE_LOCAL:-} "$dep" || {
+    $HAB_BIN install -u $HAB_BLDR_URL --channel $HAB_BLDR_CHANNEL ${IGNORE_LOCAL:-} "$@" || {
       if [[ "$HAB_BLDR_CHANNEL" != "$FALLBACK_CHANNEL" ]]; then
         build_line "Trying to install '$dep' from '$FALLBACK_CHANNEL'"
-        $HAB_BIN install -u $HAB_BLDR_URL --channel "$FALLBACK_CHANNEL" ${IGNORE_LOCAL:-} "$dep" || true
+        $HAB_BIN install -u $HAB_BLDR_URL --channel "$FALLBACK_CHANNEL" ${IGNORE_LOCAL:-} "$@" || true
       fi
     }
   fi
@@ -1083,7 +1083,11 @@ _resolve_run_dependencies() {
 
   # Append to `${pkg_deps_resolved[@]}` all resolved direct run dependencies.
   for dep in "${pkg_deps[@]}"; do
-    _install_dependency "$dep"
+    if [[ -n "${HAB_FEAT_INSTALL_HOOK:-}" ]]; then
+      _install_dependency "$dep" "--ignore-install-hook"
+    else
+      _install_dependency "$dep"
+    fi
     if resolved="$(_resolve_dependency "$dep")"; then
       build_line "Resolved dependency '$dep' to $resolved"
       pkg_deps_resolved+=($resolved)
@@ -1956,19 +1960,42 @@ do_default_build_config() {
     else
       IFS=',' read -r -a config_exclude_exts <<< "$HAB_CONFIG_EXCLUDE"
     fi
-    find_exclusions=""
+    find_exclusions=()
     for ext in "${config_exclude_exts[@]}"; do
-      find_exclusions+=" ! -name $ext"
+      find_exclusions+=(! -name "$ext")
     done
-    find "$PLAN_CONTEXT/config" "$find_exclusions" | while read -r FILE
+    find "$PLAN_CONTEXT/config" "${find_exclusions[@]}" | while read -r FILE
     do
+      local plan_context_relative_path="$pkg_prefix${FILE#$PLAN_CONTEXT}"
       if [[ -d "$FILE" ]]; then
-        mkdir -p "$pkg_prefix${FILE#$PLAN_CONTEXT}"
+        mkdir -p "$plan_context_relative_path"
       else
-        cp "$FILE" "$pkg_prefix${FILE#$PLAN_CONTEXT}"
+        cp "$FILE" "$plan_context_relative_path"
       fi
     done
     chmod 755 "$pkg_prefix"/config
+  fi
+  if [[ -n "${HAB_FEAT_INSTALL_HOOK:-}" && -d "$PLAN_CONTEXT/config_install" ]]; then
+    if [[ -z "${HAB_CONFIG_EXCLUDE:-}" ]]; then
+      # HAB_CONFIG_EXCLUDE not set, use defaults
+      config_exclude_exts=("*.sw?" "*~" "*.bak")
+    else
+      IFS=',' read -r -a config_exclude_exts <<< "$HAB_CONFIG_EXCLUDE"
+    fi
+    find_exclusions=()
+    for ext in "${config_exclude_exts[@]}"; do
+      find_exclusions+=(! -name "$ext")
+    done
+    find "$PLAN_CONTEXT/config_install" "${find_exclusions[@]}" | while read -r FILE
+    do
+      local plan_context_relative_path="$pkg_prefix${FILE#$PLAN_CONTEXT}"
+      if [[ -d "$FILE" ]]; then
+        mkdir -p "$plan_context_relative_path"
+      else
+        cp "$FILE" "$plan_context_relative_path"
+      fi
+    done
+    chmod 755 "$pkg_prefix"/config_install
   fi
   if [[ -d "$PLAN_CONTEXT/hooks" ]]; then
     cp -r "$PLAN_CONTEXT/hooks" "$pkg_prefix"

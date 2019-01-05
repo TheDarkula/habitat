@@ -15,7 +15,9 @@
 use std::path::Path;
 
 use common;
-use common::command::package::install::{InstallMode, InstallSource, LocalPackageUsage};
+use common::command::package::install::{
+    InstallHookMode, InstallMode, InstallSource, LocalPackageUsage,
+};
 use common::ui::UIWriter;
 use hcore::env as henv;
 use hcore::fs::{self, FS_ROOT_PATH};
@@ -61,6 +63,8 @@ where
         &InstallMode::default(),
         // TODO (CM): pass through and enable ignore-local mode
         &LocalPackageUsage::default(),
+        // Install hooks are run when the supervisor loads the package
+        &InstallHookMode::Ignore,
     )
     .map_err(SupError::from)
 }

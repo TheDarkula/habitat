@@ -47,11 +47,14 @@ use butterfly;
 use butterfly::member::Member;
 use butterfly::server::{timing::Timing, ServerProxy, Suitability};
 use butterfly::trace::Trace;
+use common;
+pub use common::templating::package::Pkg;
 use common::types::{EnvConfig, ListenCtlAddr};
 use futures::prelude::*;
 use futures::sync::mpsc;
 use hcore::crypto::SymKey;
 use hcore::env;
+use hcore::fs::FS_ROOT_PATH;
 use hcore::os::process::{self, Pid, Signal};
 use hcore::os::signals::{self, SignalEvent};
 use hcore::package::{Identifiable, PackageIdent, PackageInstall};
@@ -463,6 +466,21 @@ impl Manager {
                 return;
             }
         };
+
+        if feat::is_enabled(feat::InstallHook) {
+            if let Ok(package) =
+                PackageInstall::load(&service.pkg.ident, Some(Path::new(&*FS_ROOT_PATH)))
+            {
+                if let Err(err) = common::command::package::install::check_install_hooks(
+                    &mut common::ui::UI::with_sinks(),
+                    &package,
+                    Path::new(&*FS_ROOT_PATH),
+                ) {
+                    outputln!("Failed to run install hook for {}, {}", &spec.ident, err);
+                    return;
+                }
+            }
+        }
 
         if let Err(e) = service.create_svc_path() {
             outputln!(
